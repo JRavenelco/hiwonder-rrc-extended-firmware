@@ -259,7 +259,10 @@ static USBH_StatusTypeDef USBH_HID_Process(USBH_HandleTypeDef *phost)
 #if (osCMSIS < 0x20000U)
             (void)osMessagePut(phost->os_event, phost->os_msg, 0U);
 #else
-            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, NULL);
+            /* Extended firmware (GCC build): the last argument is a uint32_t timeout,
+               so it is 0U; the vendor source passes NULL, which GCC 14 and later
+               reject. The same change is made in the four calls further down. */
+            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, 0U);
 #endif
 #endif
             break;
@@ -284,7 +287,7 @@ static USBH_StatusTypeDef USBH_HID_Process(USBH_HandleTypeDef *phost)
 #if (osCMSIS < 0x20000U)
             (void)osMessagePut(phost->os_event, phost->os_msg, 0U);
 #else
-            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, NULL);
+            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, 0U);
 #endif
 #endif
             break;
@@ -300,7 +303,7 @@ static USBH_StatusTypeDef USBH_HID_Process(USBH_HandleTypeDef *phost)
 #if (osCMSIS < 0x20000U)
             (void)osMessagePut(phost->os_event, phost->os_msg, 0U);
 #else
-            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, NULL);
+            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, 0U);
 #endif
 #endif
             break;
@@ -330,7 +333,7 @@ static USBH_StatusTypeDef USBH_HID_Process(USBH_HandleTypeDef *phost)
 #if (osCMSIS < 0x20000U)
                     (void)osMessagePut(phost->os_event, phost->os_msg, 0U);
 #else
-                    (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, NULL);
+                    (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, 0U);
 #endif
 #endif
                 }
@@ -372,7 +375,7 @@ static USBH_StatusTypeDef USBH_HID_SOFProcess(USBH_HandleTypeDef *phost)
 #if (osCMSIS < 0x20000U)
             (void)osMessagePut(phost->os_event, phost->os_msg, 0U);
 #else
-            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, NULL);
+            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, 0U);
 #endif
 #endif
         }

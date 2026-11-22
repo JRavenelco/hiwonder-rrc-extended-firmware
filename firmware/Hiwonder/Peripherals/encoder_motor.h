@@ -17,6 +17,19 @@
 
 typedef struct EncoderMotorObject EncoderMotorObjectTypeDef;
 
+/* Extended firmware: state of the position mode. These numbers travel to the
+   host unchanged, in the "status" byte of every MOTOR_EXT report. */
+typedef enum {
+    ENCODER_POSITION_IDLE = 0,      /* no position command since reset */
+    ENCODER_POSITION_MOVING = 1,    /* MOVE_RELATIVE in progress */
+    ENCODER_POSITION_REACHED = 2,   /* target reached and shaft at rest */
+    ENCODER_POSITION_CANCELLED = 3, /* cancelled, stopped or replaced by a speed command */
+    ENCODER_POSITION_TIMEOUT = 4,   /* the move did not finish within its timeout */
+    /* 5 = invalid command: set by packet_handle.c in its reply, never by the motor */
+    ENCODER_POSITION_HOLDING = 6,   /* HOLD active: keeping the position */
+    ENCODER_POSITION_STALLED = 7,   /* HOLD released because the shaft was blocked (protection) */
+} EncoderPositionStatusEnum;
+
 /**
  * @brief 编码器电机对象结构体
 */
@@ -29,6 +42,19 @@ struct EncoderMotorObject{
     int current_pulse;      /**< @brief 当前输出的PWM值, 有符号对应正反转 */
     PID_ControllerTypeDef pid_controller; /**< @brief PID 控制器 */
 
+    /* Optional outer position loop. The velocity PID remains the inner loop.
+       Written by the packet task inside critical sections, used by the ISR. */
+    volatile uint8_t position_active;   /* 1 while MOVE_RELATIVE or HOLD is running */
+    volatile uint8_t position_status;   /* EncoderPositionStatusEnum */
+    uint8_t position_stable_cycles;     /* consecutive cycles in tolerance and at rest */
+    int64_t position_zero;              /* counter value reported to the host as 0 */
+    int64_t position_target;            /* absolute target, in raw counter ticks */
+    float position_max_rps;             /* speed limit of the current command, rev/s */
+    float position_kp;                  /* P gain: rev/s per tick of error */
+    int32_t position_tolerance_ticks;   /* +- window around the target */
+    uint32_t position_elapsed_cycles;   /* 100 Hz ticks since the move started */
+    uint32_t position_timeout_cycles;   /* timeout of the move, in 100 Hz ticks */
+
     /** porting 可移植硬件接口 **/
     int32_t ticks_per_circle; /**< @brief 电机输出轴旋转一圈产生的计数个数, 根据电机实际情况填写 */
 	float rps_limit;  /**< @brief 电机地转速极限，一般会取比100% PWM占空比时地转速稍小的值以确保PID控制器对速度的控制 */
@@ -39,6 +65,13 @@ struct EncoderMotorObject{
       * @retval None.
       */
     void (*set_pulse)(EncoderMotorObjectTypeDef *self, int pulse);
+
+    /* Position HOLD (MOTOR_EXT 0x05). Kept at the end of the struct so that the
+       offsets of the older fields, which the SWD diagnostic tools read straight
+       from RAM, do not move. */
+    volatile uint8_t position_hold;
+    int16_t hold_max_pulse;     /* PWM cap while holding (300..1000) */
+    uint16_t hold_stall_cycles; /* consecutive cycles at the cap without moving */
 };
 
 
@@ -78,5 +111,60 @@ void encoder_motor_control(EncoderMotorObjectTypeDef *self, float period);
 */
 void encoder_motor_set_speed(EncoderMotorObjectTypeDef *self, float rps);
 
-#endif
+/**
+ * @brief Immediate, safe stop of the motor.
+ *
+ * Forces the accumulated PWM to zero instead of leaving it to the PID. This is
+ * needed because the loop is incremental (pulse += output): if the feedback is
+ * missing or frozen, a zero set point gives zero error, zero output and a PWM
+ * STUCK at its last value, with the motor spinning indefinitely.
+ */
+void encoder_motor_stop(EncoderMotorObjectTypeDef *self);
 
+/**
+ * @brief Starts a relative move of delta_ticks from the current position.
+ *
+ * @param delta_ticks     signed distance in encoder ticks (not zero)
+ * @param max_rps         speed limit of the move, in (0, rps_limit] rev/s
+ * @param tolerance_ticks the move is REACHED inside +-tolerance (at least 1)
+ * @param timeout_ms      100..60000 ms; when it expires the status is TIMEOUT
+ * @return 0 if accepted; -1 if any parameter is out of range (nothing changes).
+ */
+int encoder_motor_move_relative(EncoderMotorObjectTypeDef *self,
+                                int32_t delta_ticks,
+                                float max_rps,
+                                int32_t tolerance_ticks,
+                                uint32_t timeout_ms);
+/**
+ * @brief Position HOLD, like motor.HOLD on a LEGO SPIKE hub: keeps the current
+ *        counter with no timeout and, if the shaft is pushed away, drives it
+ *        back with the same control law as MOVE_RELATIVE.
+ *
+ * The PWM is limited to max_pulse. If the motor pushes at that cap without
+ * moving for 3 s (blocked shaft), the HOLD is released with status STALLED and
+ * zero PWM, so that neither the motor nor the driver overheats. A speed
+ * command, MOVE_RELATIVE, CANCEL or a stop all end the HOLD.
+ * @return 0 if accepted; -1 if any parameter is out of range.
+ */
+int encoder_motor_hold(EncoderMotorObjectTypeDef *self,
+                       float max_rps,
+                       int32_t tolerance_ticks,
+                       int max_pulse);
+/** @brief Outer position loop. Call once per 100 Hz control tick (TIM7 ISR),
+ *         after encoder_update() and before encoder_motor_control(). */
+void encoder_motor_position_control(EncoderMotorObjectTypeDef *self);
+/** @brief Leaves the position mode (status CANCELLED) and asks for zero speed. */
+void encoder_motor_position_cancel(EncoderMotorObjectTypeDef *self);
+/** @brief Makes the current position the origin of the reported positions. */
+void encoder_motor_position_zero(EncoderMotorObjectTypeDef *self);
+/** @brief Coherent copy of position, target, error, speed and state. Positions
+ *         are relative to the origin set by encoder_motor_position_zero(). */
+void encoder_motor_position_snapshot(EncoderMotorObjectTypeDef *self,
+                                     int32_t *position_ticks,
+                                     int32_t *target_ticks,
+                                     int32_t *error_ticks,
+                                     float *rps,
+                                     uint8_t *active,
+                                     uint8_t *status);
+
+#endif

@@ -90,6 +90,12 @@
 #include "QMI8658.h"
 #include "u8g2_porting.h"
 
+/* Extended firmware: minimum interval between IMU reports to the host (ms).
+   50 ms = 20 Hz at most: bounded telemetry that cannot flood the 1 Mbaud UART.
+   The vendor source ships with this report commented out. On the wire it is
+   six little-endian floats: acceleration in m/s^2, then angular rate in rad/s. */
+#define IMU_REPORT_INTERVAL_MS 50u
+
 #if ENABLE_IMU
 /**
  * @brief  imu task 入口函数
@@ -115,6 +121,8 @@ void imu_task_entry(void *argument)
 	}
     osDelay(100);
     PacketReportIMU_Raw_TypeDef report;
+    uint32_t last_report_tick = 0u;   /* last report sent to the host, in 1 ms kernel ticks */
+    uint32_t now_tick;
 		
     for(;;) {
 		//等待IMU中断发送的信号量，若没有，则一直阻塞等待 osWaitForever
@@ -128,7 +136,14 @@ void imu_task_entry(void *argument)
 			
 		//获取Roll、Pitch、重力加速度值请放开下2行注释(第2行注释语句需要配合树莓派等上位机运行搭配ros开发功能包使用) 
         //printf("%d,%d,%d\r\n",(int)report.array.accel_array[0],(int)report.array.accel_array[1],(int)report.array.accel_array[2]);
-        //packet_transmit(&packet_controller, PACKET_FUNC_IMU, &report, sizeof(PacketReportIMU_Raw_TypeDef));
+        /* IMU telemetry to the host with an explicit interval. The loop already
+           runs at ~20 Hz because of the osDelay(50) below; the tick guard keeps
+           the limit true even if the pace of the loop changes in the future. */
+        now_tick = osKernelGetTickCount();
+        if((now_tick - last_report_tick) >= IMU_REPORT_INTERVAL_MS) {
+            last_report_tick = now_tick;
+            packet_transmit(&packet_controller, PACKET_FUNC_IMU, &report, sizeof(PacketReportIMU_Raw_TypeDef));
+        }
         osDelay(50);
     }
 }

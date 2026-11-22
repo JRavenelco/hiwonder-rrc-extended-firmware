@@ -55,7 +55,13 @@ enum PACKET_FUNCTION {
     PACKET_FUNC_IMU,
     PACKET_FUNC_GAMEPAD,
     PACKET_FUNC_SBUS,
-    PACKET_FUNC_NONE,
+    /* Extended firmware: position control of one motor (handled in
+       packet_handle.c). The values are written out so that the vendor's
+       function numbers above can never shift; 0x0A stays free.
+       PACKET_FUNC_NONE must remain last: it is the size of the handler
+       table and the bound the frame parser checks the function byte against. */
+    PACKET_FUNC_MOTOR_EXT = 0x0B,
+    PACKET_FUNC_NONE = 0x0C,
 };
 
 typedef void(*packet_handle)(struct PacketRawFrame *);

@@ -53,6 +53,9 @@ typedef struct{
 
 void set_chassis_type(uint8_t chassis_type);
 
+/* Refreshes the watchdog (IWDG) from the TIM7 ISR while the RTOS is still alive (app.c). */
+void watchdog_isr_kick(void);
+
 
 #endif
 

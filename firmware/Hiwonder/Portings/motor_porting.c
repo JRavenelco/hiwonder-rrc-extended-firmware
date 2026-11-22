@@ -40,6 +40,22 @@ void set_motor_type(EncoderMotorObjectTypeDef *motor, MotorTypeEnum type) {
 	}
 }
 
+void apply_project_motor_config(void)
+{
+    /* JGB37-520R30-12 on M1 and on the position motor (M4 since 2026-10-04):
+       11 encoder lines * x4 quadrature * 1:30 gearbox = 1320 ticks per turn of
+       the output shaft (confirmed on the bench with a mark on the shaft).
+
+       Gains: do NOT use the JGB520 profile that the JETACKER chassis imposes
+       (3960 ticks, KP 63); it is tuned for a 1:90 gearbox. A 1:30 gearbox turns
+       ~3x faster for the same PWM, so the open-loop gain is ~3x higher and the
+       loop oscillates. The vendor itself lowers KP from 63 to 40 in its JGB37
+       profile (1980 ticks). The values below were validated on the bench on
+       M1 (2026-08-22). Arguments: ticks per turn, speed limit, KP, KI, KD. */
+    set_motor_param(motors[0], 1320, PROJECT_MOTOR_RPS_LIMIT, 21.0f, 0.9f, 0.8f);
+    set_motor_param(motors[POSITION_MOTOR_INDEX], 1320, PROJECT_MOTOR_RPS_LIMIT, 21.0f, 0.9f, 0.8f);
+}
+
 void motors_init(void)
 {
     for(int i = 0; i < 4; ++i) {
@@ -56,6 +72,9 @@ void motors_init(void)
 
     /* 马达 1 */
     motors[0]->set_pulse = motor1_set_pulse;
+    /* Project motor configuration: applied here and, more importantly, again
+       after set_chassis_type() (see apply_project_motor_config). */
+    apply_project_motor_config();
     __HAL_TIM_SET_COUNTER(&htim1, 0);
     __HAL_TIM_ENABLE(&htim1);
     __HAL_TIM_MOE_ENABLE(&htim1);
@@ -108,7 +127,10 @@ void motors_init(void)
     __HAL_TIM_CLEAR_IT(&htim3, TIM_IT_UPDATE);
     __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
     __HAL_TIM_ENABLE(&htim3);
-    HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
+    /* Vendor bug fixed here: the original line started &htim4 (the M3 encoder)
+       a second time instead of &htim3, which left TIM3 without CC1E/CC2E
+       (TIM3_CCER read back as 0 over SWD on the bench). */
+    HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
 
 
     // 测速更新定时器
@@ -188,7 +210,3 @@ static void motor4_set_pulse(EncoderMotorObjectTypeDef *self, int speed)
     HAL_TIM_PWM_Start(&htim10, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim11, TIM_CHANNEL_1);
 }
-
-
-
-

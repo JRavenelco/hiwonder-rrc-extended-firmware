@@ -380,9 +380,9 @@ void EXTI15_10_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI15_10_IRQn 0 */
     extern osSemaphoreId_t IMU_data_readyHandle;
-    if(__HAL_GPIO_EXTI_GET_IT(IMU_ITR_Pin) != RESET) {	//ÊÇ·ñÎªIMUÖÐ¶ÏÒý½ÅÐÅºÅ
-        __HAL_GPIO_EXTI_CLEAR_IT(IMU_ITR_Pin);	//Çå³ýIMUÖÐ¶ÏÒý½ÅÐÅºÅ
-		//·¢ËÍÐÅºÅÁ¿
+    if(__HAL_GPIO_EXTI_GET_IT(IMU_ITR_Pin) != RESET) {	//ï¿½Ç·ï¿½ÎªIMUï¿½Ð¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Åºï¿½
+        __HAL_GPIO_EXTI_CLEAR_IT(IMU_ITR_Pin);	//ï¿½ï¿½ï¿½IMUï¿½Ð¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Åºï¿½
+		//ï¿½ï¿½ï¿½ï¿½ï¿½Åºï¿½ï¿½ï¿½
         osSemaphoreRelease(IMU_data_readyHandle);
     }
   /* USER CODE END EXTI15_10_IRQn 0 */
@@ -513,9 +513,22 @@ void TIM7_IRQHandler(void)
 		encoder_update(motors[1], 0.01, __HAL_TIM_GET_COUNTER(&htim2));
 		encoder_update(motors[2], 0.01, __HAL_TIM_GET_COUNTER(&htim4));
 		encoder_update(motors[3], 0.01, __HAL_TIM_GET_COUNTER(&htim3));
+		/* Extended firmware: this 100 Hz tick is the complete motor control loop,
+		   and the order matters:
+		     1. encoder_update() above samples the four quadrature counters
+		        (M1..M4 = TIM5, TIM2, TIM4, TIM3) and refreshes the position
+		        (counter) and the speed (rps) of each motor.
+		     2. The outer position loop of the one position-controlled motor
+		        turns its position error into a speed set point.
+		     3. The vendor's inner speed loop drives the four motors towards
+		        their set points and writes the PWM.
+		     4. The independent watchdog is refreshed last, and only while the
+		        RTOS still shows signs of life (watchdog_isr_kick() in app.c). */
+		encoder_motor_position_control(motors[POSITION_MOTOR_INDEX]);
 		for(int i = 0; i < 4; ++i) {
 			encoder_motor_control(motors[i], 0.01);
 		}
+		watchdog_isr_kick();
     }
   /* USER CODE END TIM7_IRQn 0 */
   /* USER CODE BEGIN TIM7_IRQn 1 */
@@ -585,3 +598,4 @@ void OTG_HS_IRQHandler(void)
 /* USER CODE BEGIN 1 */
 
 /* USER CODE END 1 */
+

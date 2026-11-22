@@ -12,6 +12,15 @@
 //#define BATTERY_LOW_ALARM_THRESHOLD 6300  /* 低电压报警阈值, 单位毫伏 */
 #define BATTERY_LOW_ALARM_THRESHOLD 9600
 
+/* Extended firmware: the motor with position control (MOTOR_EXT 0x0B).
+   Index 0..3 = M1..M4. Only this one motor gets the outer position loop; to
+   move it to another port, change the index here (it went from M1 to M4 on
+   2026-10-04, with the same JGB37-520R30-12 motor). */
+#define POSITION_MOTOR_INDEX 3u
+#if POSITION_MOTOR_INDEX > 3u
+#error "POSITION_MOTOR_INDEX must be between 0 and 3"
+#endif
+
 
 #define KEY1_PUSHED_LEVEL 0
 #define KEY2_PUSHED_LEVEL 0
