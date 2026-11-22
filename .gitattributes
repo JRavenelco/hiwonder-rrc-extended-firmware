@@ -1,0 +1,3 @@
+# The vendor sources mix CRLF and LF line endings and legacy encodings.
+# Store every file byte for byte: the reproducible build depends on it.
+* -text
