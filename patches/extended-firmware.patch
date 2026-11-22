@@ -1,0 +1,1072 @@
+diff -ruN '--exclude=*.o' '--exclude=*.d' '--exclude=*.crf' '--exclude=*.axf' '--exclude=*.htm' '--exclude=*.lnp' '--exclude=*.dep' '--exclude=*.lst' '--exclude=*.map' '--exclude=*.hex' '--exclude=*.bin' '--exclude=*.elf' '--exclude=*.uvguix.*' '--exclude=build-gcc' '--exclude=DebugConfig' official_v1_2/RosRobotControllerM4-armclang/Core/Src/stm32f4xx_it.c extended_m1/RosRobotControllerM4-armclang/Core/Src/stm32f4xx_it.c
+--- official_v1_2/RosRobotControllerM4-armclang/Core/Src/stm32f4xx_it.c	2026-07-27 19:35:18.674683086 -0600
++++ extended_m1/RosRobotControllerM4-armclang/Core/Src/stm32f4xx_it.c	2026-11-21 18:03:14.032612142 -0600
+@@ -380,9 +380,9 @@
+ {
+   /* USER CODE BEGIN EXTI15_10_IRQn 0 */
+     extern osSemaphoreId_t IMU_data_readyHandle;
+-    if(__HAL_GPIO_EXTI_GET_IT(IMU_ITR_Pin) != RESET) {	//�Ƿ�ΪIMU�ж������ź�
+-        __HAL_GPIO_EXTI_CLEAR_IT(IMU_ITR_Pin);	//���IMU�ж������ź�
+-		//�����ź���
++    if(__HAL_GPIO_EXTI_GET_IT(IMU_ITR_Pin) != RESET) {	//�Ƿ�ΪIMU�ж������ź�
++        __HAL_GPIO_EXTI_CLEAR_IT(IMU_ITR_Pin);	//���IMU�ж������ź�
++		//�����ź���
+         osSemaphoreRelease(IMU_data_readyHandle);
+     }
+   /* USER CODE END EXTI15_10_IRQn 0 */
+@@ -513,9 +513,22 @@
+ 		encoder_update(motors[1], 0.01, __HAL_TIM_GET_COUNTER(&htim2));
+ 		encoder_update(motors[2], 0.01, __HAL_TIM_GET_COUNTER(&htim4));
+ 		encoder_update(motors[3], 0.01, __HAL_TIM_GET_COUNTER(&htim3));
++		/* Extended firmware: this 100 Hz tick is the complete motor control loop,
++		   and the order matters:
++		     1. encoder_update() above samples the four quadrature counters
++		        (M1..M4 = TIM5, TIM2, TIM4, TIM3) and refreshes the position
++		        (counter) and the speed (rps) of each motor.
++		     2. The outer position loop of the one position-controlled motor
++		        turns its position error into a speed set point.
++		     3. The vendor's inner speed loop drives the four motors towards
++		        their set points and writes the PWM.
++		     4. The independent watchdog is refreshed last, and only while the
++		        RTOS still shows signs of life (watchdog_isr_kick() in app.c). */
++		encoder_motor_position_control(motors[POSITION_MOTOR_INDEX]);
+ 		for(int i = 0; i < 4; ++i) {
+ 			encoder_motor_control(motors[i], 0.01);
+ 		}
++		watchdog_isr_kick();
+     }
+   /* USER CODE END TIM7_IRQn 0 */
+   /* USER CODE BEGIN TIM7_IRQn 1 */
+@@ -585,3 +598,4 @@
+ /* USER CODE BEGIN 1 */
+ 
+ /* USER CODE END 1 */
++
+diff -ruN '--exclude=*.o' '--exclude=*.d' '--exclude=*.crf' '--exclude=*.axf' '--exclude=*.htm' '--exclude=*.lnp' '--exclude=*.dep' '--exclude=*.lst' '--exclude=*.map' '--exclude=*.hex' '--exclude=*.bin' '--exclude=*.elf' '--exclude=*.uvguix.*' '--exclude=build-gcc' '--exclude=DebugConfig' official_v1_2/RosRobotControllerM4-armclang/Hiwonder/Misc/packet.h extended_m1/RosRobotControllerM4-armclang/Hiwonder/Misc/packet.h
+--- official_v1_2/RosRobotControllerM4-armclang/Hiwonder/Misc/packet.h	2026-07-27 19:35:37.344741867 -0600
++++ extended_m1/RosRobotControllerM4-armclang/Hiwonder/Misc/packet.h	2026-11-21 18:30:05.911035145 -0600
+@@ -55,7 +55,13 @@
+     PACKET_FUNC_IMU,
+     PACKET_FUNC_GAMEPAD,
+     PACKET_FUNC_SBUS,
+-    PACKET_FUNC_NONE,
++    /* Extended firmware: position control of one motor (handled in
++       packet_handle.c). The values are written out so that the vendor's
++       function numbers above can never shift; 0x0A stays free.
++       PACKET_FUNC_NONE must remain last: it is the size of the handler
++       table and the bound the frame parser checks the function byte against. */
++    PACKET_FUNC_MOTOR_EXT = 0x0B,
++    PACKET_FUNC_NONE = 0x0C,
+ };
+ 
+ typedef void(*packet_handle)(struct PacketRawFrame *);
+diff -ruN '--exclude=*.o' '--exclude=*.d' '--exclude=*.crf' '--exclude=*.axf' '--exclude=*.htm' '--exclude=*.lnp' '--exclude=*.dep' '--exclude=*.lst' '--exclude=*.map' '--exclude=*.hex' '--exclude=*.bin' '--exclude=*.elf' '--exclude=*.uvguix.*' '--exclude=build-gcc' '--exclude=DebugConfig' official_v1_2/RosRobotControllerM4-armclang/Hiwonder/Peripherals/encoder_motor.c extended_m1/RosRobotControllerM4-armclang/Hiwonder/Peripherals/encoder_motor.c
+--- official_v1_2/RosRobotControllerM4-armclang/Hiwonder/Peripherals/encoder_motor.c	2026-07-27 19:35:37.461742229 -0600
++++ extended_m1/RosRobotControllerM4-armclang/Hiwonder/Peripherals/encoder_motor.c	2026-11-21 18:30:05.911035145 -0600
+@@ -13,6 +13,58 @@
+ #include "encoder_motor.h"
+ #include "gpio.h"
+ 
++/* ---------------------------------------------------------------------------
++ * EXTENDED FIRMWARE - position control on top of the vendor's speed control
++ *
++ * The vendor firmware only offers closed-loop SPEED control. This file adds a
++ * closed-loop POSITION mode as a cascade:
++ *
++ *   position error [ticks] --P--> speed set point [rev/s] --vendor PID--> PWM
++ *
++ *   - Outer loop: encoder_motor_position_control(), a proportional controller
++ *     called from the TIM7 interrupt at 100 Hz, right after the encoders are
++ *     sampled. Its output is pid_controller.set_point and nothing else.
++ *   - Inner loop: the vendor's encoder_motor_control(), untouched except for
++ *     the PWM cap used by HOLD. It is an INCREMENTAL controller
++ *     (pulse += PID output), which is why a plain "set point = 0" does not
++ *     stop a motor that has no valid feedback; see encoder_motor_stop().
++ *
++ * Two position modes share the outer loop:
++ *   MOVE_RELATIVE  go to counter + delta; report REACHED once the error stays
++ *                  inside the tolerance with the shaft at rest, or TIMEOUT.
++ *   HOLD           keep the current counter indefinitely with a limited PWM,
++ *                  and let go (STALLED) if the shaft is blocked for 3 s.
++ *
++ * Concurrency: the control functions run inside the TIM7 ISR, while the
++ * commands arrive from the packet task. Every command therefore updates the
++ * shared fields inside a short critical section (PRIMASK is saved and
++ * restored, so the functions are also safe with interrupts already off).
++ * ------------------------------------------------------------------------- */
++#define POSITION_LOOP_HZ             100u   /* rate of the TIM7 control tick */
++/* Outer position loop (P) that outputs a speed set point.
++   Bench result, 2026-08-01, with KP=0.004 / MIN=0.20: 100 % overshoot
++   (target 110 ticks, peak 219). Cause: with a low KP the proportional speed
++   falls below the minimum once the error is under ~50 ticks, so the last
++   stretch is driven at CONSTANT speed, with no braking at all.
++   The minimum exists to get past the PWM dead band (250/1000), but applied
++   close to the target it guarantees an overshoot. With the values below
++   (bench, 2026-08-22) the same 110-tick move overshoots by about 10 %. */
++#define POSITION_DEFAULT_KP          0.006f /* rev/s commanded per tick of error */
++#define POSITION_MIN_COMMAND_RPS     0.10f  /* smallest non-zero speed command */
++#define POSITION_STOP_RPS            0.05f  /* below this the shaft counts as at rest */
++#define POSITION_REQUIRED_STABLE     5u     /* cycles in tolerance and at rest -> REACHED */
++/* HOLD: the PWM cap must be above the dead band (250) or it could never push back. */
++#define HOLD_MIN_PULSE               300
++#define HOLD_STALL_LIMIT_CYCLES      300u  /* 3 s at the cap without moving -> release */
++
++/* Saturates a 64-bit tick count to the int32 range used on the wire. */
++static int64_t clamp_i64_to_i32(int64_t value)
++{
++    if(value > 2147483647LL) return 2147483647LL;
++    if(value < -2147483647LL - 1LL) return -2147483647LL - 1LL;
++    return value;
++}
++
+ /**
+  * @brief 编码器电机速度测量更新
+  * @detials
+@@ -47,12 +99,14 @@
+         /* 对输出的 PWM 值进行限幅, 限幅根据定时器的设置确定，本示例定时器设置的占空比 0-100 对应 0-1000 */
+         pulse = pulse > 1000 ?  1000 : pulse;
+         pulse = pulse < -1000 ? -1000 : pulse;
++        if(self->position_hold) {   /* HOLD: its own, lower PWM cap */
++            pulse = pulse > self->hold_max_pulse ? self->hold_max_pulse : pulse;
++            pulse = pulse < -self->hold_max_pulse ? -self->hold_max_pulse : pulse;
++        }
+     }
+     self->set_pulse(self, pulse > -250 && pulse < 250 ? 0 : pulse); /* 设置新的PWM值且限制 PWM 的最小值, PWM过小电机只会发出嗡嗡声而不动 */
+     self->current_pulse = pulse; /* 记录新的 PWM 值 */
+ }
+-
+-
+ /**
+  * @brief 编码器电机设置PID控制目标速度
+  * @param self self 编码器电机对象指针
+@@ -61,10 +115,237 @@
+  */
+ void encoder_motor_set_speed(EncoderMotorObjectTypeDef *self, float rps)
+ {
++    /* Extended firmware: a plain speed command takes the motor out of any
++       position mode (MOVE_RELATIVE or HOLD). */
++    self->position_hold = 0;
++    self->position_active = 0;
++    self->position_status = ENCODER_POSITION_CANCELLED;
+     rps = rps > self->rps_limit ? self->rps_limit : (rps < -self->rps_limit ? -self->rps_limit : rps); /* 对速度进行限幅 */
+     self->pid_controller.set_point = rps; /* 设置 PID 控制器目标 */
+ }
+ 
++/* Empties the incremental loop and forces the PWM to zero. Without this the
++   PWM stays stuck at its last value whenever there is no valid feedback.
++   Call it with interrupts disabled or from the TIM7 ISR. */
++static void encoder_motor_zero_output(EncoderMotorObjectTypeDef *self)
++{
++    self->pid_controller.set_point = 0.0f;
++    self->pid_controller.previous_0_err = 0.0f;
++    self->pid_controller.previous_1_err = 0.0f;
++    self->pid_controller.output = 0.0f;
++    self->current_pulse = 0;
++    if(NULL != self->set_pulse) {
++        self->set_pulse(self, 0);
++    }
++}
++
++/* Hard stop: leaves any position mode and zeroes the PWM at once. The header
++   explains why a zero set point alone is not enough. */
++void encoder_motor_stop(EncoderMotorObjectTypeDef *self)
++{
++    uint32_t primask = __get_PRIMASK();
++    __disable_irq();
++    self->position_hold = 0;
++    self->position_active = 0;
++    self->position_status = ENCODER_POSITION_CANCELLED;
++    encoder_motor_zero_output(self);
++    if(!primask) __enable_irq();
++}
++
++/* Starts a relative move. The parameters are validated first and a rejected
++   command changes nothing. The target is absolute (counter + delta) and is
++   latched together with its limits inside one critical section, so the ISR
++   never sees a half-written command. */
++int encoder_motor_move_relative(EncoderMotorObjectTypeDef *self,
++                                int32_t delta_ticks,
++                                float max_rps,
++                                int32_t tolerance_ticks,
++                                uint32_t timeout_ms)
++{
++    uint32_t primask;
++    if((delta_ticks == 0) || (max_rps <= 0.0f) ||
++       (max_rps > self->rps_limit) || (tolerance_ticks < 1) ||
++       (timeout_ms < 100u) || (timeout_ms > 60000u)) {
++        return -1;
++    }
++
++    primask = __get_PRIMASK();
++    __disable_irq();
++    self->position_hold = 0;   /* a new move replaces an active HOLD */
++    self->position_target = self->counter + delta_ticks;
++    self->position_max_rps = max_rps;
++    self->position_tolerance_ticks = tolerance_ticks;
++    self->position_elapsed_cycles = 0;
++    self->position_timeout_cycles = (timeout_ms * POSITION_LOOP_HZ + 999u) / 1000u; /* ms -> control ticks, rounded up */
++    self->position_stable_cycles = 0;
++    self->position_status = ENCODER_POSITION_MOVING;
++    self->position_active = 1;
++    if(!primask) __enable_irq();
++    return 0;
++}
++
++/* Starts a HOLD at the current counter value. max_pulse caps the PWM while
++   holding; it must be above the dead band (HOLD_MIN_PULSE) or the motor could
++   not push back at all. */
++int encoder_motor_hold(EncoderMotorObjectTypeDef *self,
++                       float max_rps,
++                       int32_t tolerance_ticks,
++                       int max_pulse)
++{
++    uint32_t primask;
++    if((max_rps <= 0.0f) || (max_rps > self->rps_limit) || (tolerance_ticks < 1) ||
++       (max_pulse < HOLD_MIN_PULSE) || (max_pulse > 1000)) {
++        return -1;
++    }
++
++    primask = __get_PRIMASK();
++    __disable_irq();
++    self->position_target = self->counter;
++    self->position_max_rps = max_rps;
++    self->position_tolerance_ticks = tolerance_ticks;
++    self->position_stable_cycles = 0;
++    self->position_elapsed_cycles = 0;
++    self->hold_max_pulse = (int16_t)max_pulse;
++    self->hold_stall_cycles = 0;
++    self->position_hold = 1;
++    self->position_status = ENCODER_POSITION_HOLDING;
++    self->position_active = 1;
++    if(!primask) __enable_irq();
++    return 0;
++}
++
++/* The control law shared by MOVE_RELATIVE and HOLD: proportional to the
++   error, limited to +-position_max_rps and never slower than
++   POSITION_MIN_COMMAND_RPS, so that the request always clears the dead band. */
++static float position_speed_command(EncoderMotorObjectTypeDef *self, int64_t error)
++{
++    float speed = (float)error * self->position_kp;
++    if(speed > self->position_max_rps) speed = self->position_max_rps;
++    if(speed < -self->position_max_rps) speed = -self->position_max_rps;
++    if((speed > 0.0f) && (speed < POSITION_MIN_COMMAND_RPS)) speed = POSITION_MIN_COMMAND_RPS;
++    if((speed < 0.0f) && (speed > -POSITION_MIN_COMMAND_RPS)) speed = -POSITION_MIN_COMMAND_RPS;
++    return speed;
++}
++
++/* Outer position loop. Runs in the TIM7 ISR at 100 Hz, after the encoders
++   have been sampled and before the speed loop. It never drives the PWM itself
++   (except to release a stalled HOLD): its output is the speed set point of
++   the vendor's PID. */
++void encoder_motor_position_control(EncoderMotorObjectTypeDef *self)
++{
++    int64_t error;
++    float speed;
++
++    if(!self->position_active) return;
++
++    error = self->position_target - self->counter;
++
++    if(self->position_hold) {
++        /* HOLD: no timeout and no "reached". Blocked (PWM at the cap, shaft at
++           rest and still outside the tolerance) for 3 s -> release, PWM to zero. */
++        const int outside = (error > self->position_tolerance_ticks) ||
++                            (error < -self->position_tolerance_ticks);
++        const int at_cap = (self->current_pulse >= self->hold_max_pulse) ||
++                           (self->current_pulse <= -self->hold_max_pulse);
++        if(outside && at_cap &&
++           (self->rps <= POSITION_STOP_RPS) && (self->rps >= -POSITION_STOP_RPS)) {
++            if(++self->hold_stall_cycles >= HOLD_STALL_LIMIT_CYCLES) {
++                self->position_hold = 0;
++                self->position_active = 0;
++                self->position_status = ENCODER_POSITION_STALLED;
++                encoder_motor_zero_output(self);
++                return;
++            }
++        } else {
++            self->hold_stall_cycles = 0;
++        }
++        self->pid_controller.set_point = outside ? position_speed_command(self, error) : 0.0f;
++        return;
++    }
++
++    /* MOVE_RELATIVE. Inside the tolerance: ask for zero speed and report
++       REACHED only after the shaft has also been at rest for
++       POSITION_REQUIRED_STABLE consecutive cycles (50 ms). */
++    if((error <= self->position_tolerance_ticks) &&
++       (error >= -self->position_tolerance_ticks)) {
++        self->pid_controller.set_point = 0.0f;
++        if((self->rps <= POSITION_STOP_RPS) && (self->rps >= -POSITION_STOP_RPS)) {
++            if(++self->position_stable_cycles >= POSITION_REQUIRED_STABLE) {
++                self->position_active = 0;
++                self->position_status = ENCODER_POSITION_REACHED;
++                return;
++            }
++        } else {
++            self->position_stable_cycles = 0;
++        }
++    } else {
++        self->position_stable_cycles = 0;
++    }
++
++    /* Give up when the timeout requested by the host expires. */
++    if(++self->position_elapsed_cycles >= self->position_timeout_cycles) {
++        self->position_active = 0;
++        self->position_status = ENCODER_POSITION_TIMEOUT;
++        self->pid_controller.set_point = 0.0f;
++        return;
++    }
++
++    if((error <= self->position_tolerance_ticks) &&
++       (error >= -self->position_tolerance_ticks)) return;
++
++    /* Still outside the tolerance: keep driving towards the target. */
++    speed = position_speed_command(self, error);
++    self->pid_controller.set_point = speed;
++}
++
++/* Leaves the position mode; the speed loop then brings the motor to rest.
++   Use encoder_motor_stop() instead when the feedback cannot be trusted. */
++void encoder_motor_position_cancel(EncoderMotorObjectTypeDef *self)
++{
++    uint32_t primask = __get_PRIMASK();
++    __disable_irq();
++    self->position_hold = 0;
++    self->position_active = 0;
++    self->position_status = ENCODER_POSITION_CANCELLED;
++    self->pid_controller.set_point = 0.0f;
++    if(!primask) __enable_irq();
++}
++
++/* The current position becomes the origin of the positions reported to the
++   host. The control itself always works on the raw counter. */
++void encoder_motor_position_zero(EncoderMotorObjectTypeDef *self)
++{
++    uint32_t primask = __get_PRIMASK();
++    __disable_irq();
++    self->position_zero = self->counter;
++    if(!primask) __enable_irq();
++}
++
++/* Coherent copy of the state for a MOTOR_EXT report, taken with interrupts
++   disabled. Positions are relative to the origin and saturate at int32. */
++void encoder_motor_position_snapshot(EncoderMotorObjectTypeDef *self,
++                                     int32_t *position_ticks,
++                                     int32_t *target_ticks,
++                                     int32_t *error_ticks,
++                                     float *rps,
++                                     uint8_t *active,
++                                     uint8_t *status)
++{
++    uint32_t primask = __get_PRIMASK();
++    int64_t position;
++    int64_t target;
++    __disable_irq();
++    position = self->counter - self->position_zero;
++    target = self->position_target - self->position_zero;
++    *position_ticks = (int32_t)clamp_i64_to_i32(position);
++    *target_ticks = (int32_t)clamp_i64_to_i32(target);
++    *error_ticks = (int32_t)clamp_i64_to_i32(self->position_target - self->counter);
++    *rps = self->rps;
++    *active = self->position_active;
++    *status = self->position_status;
++    if(!primask) __enable_irq();
++}
++
+ 
+ /**
+  * @breif 编码器电机对象初始化
+@@ -79,7 +360,20 @@
+     self->rps = 0;
+     self->current_pulse = 0;
+     self->ticks_overflow = 0;
++    /* Extended firmware: position mode off, with safe defaults. */
++    self->position_active = 0;
++    self->position_status = ENCODER_POSITION_IDLE;
++    self->position_stable_cycles = 0;
++    self->position_zero = 0;
++    self->position_target = 0;
++    self->position_max_rps = 1.0f;
++    self->position_kp = POSITION_DEFAULT_KP;
++    self->position_tolerance_ticks = 8;
++    self->position_elapsed_cycles = 0;
++    self->position_timeout_cycles = POSITION_LOOP_HZ;
++    self->position_hold = 0;
++    self->hold_max_pulse = 1000;
++    self->hold_stall_cycles = 0;
+     self->ticks_per_circle = 9999; /* 电机输出轴旋转一圈产生的计数个数, 根据电机实际情况填写 */
+     pid_controller_init(&self->pid_controller, 0, 0, 0);
+ }
+-
+diff -ruN '--exclude=*.o' '--exclude=*.d' '--exclude=*.crf' '--exclude=*.axf' '--exclude=*.htm' '--exclude=*.lnp' '--exclude=*.dep' '--exclude=*.lst' '--exclude=*.map' '--exclude=*.hex' '--exclude=*.bin' '--exclude=*.elf' '--exclude=*.uvguix.*' '--exclude=build-gcc' '--exclude=DebugConfig' official_v1_2/RosRobotControllerM4-armclang/Hiwonder/Peripherals/encoder_motor.h extended_m1/RosRobotControllerM4-armclang/Hiwonder/Peripherals/encoder_motor.h
+--- official_v1_2/RosRobotControllerM4-armclang/Hiwonder/Peripherals/encoder_motor.h	2026-07-27 19:35:37.473742266 -0600
++++ extended_m1/RosRobotControllerM4-armclang/Hiwonder/Peripherals/encoder_motor.h	2026-11-21 18:30:05.911035145 -0600
+@@ -17,6 +17,19 @@
+ 
+ typedef struct EncoderMotorObject EncoderMotorObjectTypeDef;
+ 
++/* Extended firmware: state of the position mode. These numbers travel to the
++   host unchanged, in the "status" byte of every MOTOR_EXT report. */
++typedef enum {
++    ENCODER_POSITION_IDLE = 0,      /* no position command since reset */
++    ENCODER_POSITION_MOVING = 1,    /* MOVE_RELATIVE in progress */
++    ENCODER_POSITION_REACHED = 2,   /* target reached and shaft at rest */
++    ENCODER_POSITION_CANCELLED = 3, /* cancelled, stopped or replaced by a speed command */
++    ENCODER_POSITION_TIMEOUT = 4,   /* the move did not finish within its timeout */
++    /* 5 = invalid command: set by packet_handle.c in its reply, never by the motor */
++    ENCODER_POSITION_HOLDING = 6,   /* HOLD active: keeping the position */
++    ENCODER_POSITION_STALLED = 7,   /* HOLD released because the shaft was blocked (protection) */
++} EncoderPositionStatusEnum;
++
+ /**
+  * @brief 编码器电机对象结构体
+ */
+@@ -29,6 +42,19 @@
+     int current_pulse;      /**< @brief 当前输出的PWM值, 有符号对应正反转 */
+     PID_ControllerTypeDef pid_controller; /**< @brief PID 控制器 */
+ 
++    /* Optional outer position loop. The velocity PID remains the inner loop.
++       Written by the packet task inside critical sections, used by the ISR. */
++    volatile uint8_t position_active;   /* 1 while MOVE_RELATIVE or HOLD is running */
++    volatile uint8_t position_status;   /* EncoderPositionStatusEnum */
++    uint8_t position_stable_cycles;     /* consecutive cycles in tolerance and at rest */
++    int64_t position_zero;              /* counter value reported to the host as 0 */
++    int64_t position_target;            /* absolute target, in raw counter ticks */
++    float position_max_rps;             /* speed limit of the current command, rev/s */
++    float position_kp;                  /* P gain: rev/s per tick of error */
++    int32_t position_tolerance_ticks;   /* +- window around the target */
++    uint32_t position_elapsed_cycles;   /* 100 Hz ticks since the move started */
++    uint32_t position_timeout_cycles;   /* timeout of the move, in 100 Hz ticks */
++
+     /** porting 可移植硬件接口 **/
+     int32_t ticks_per_circle; /**< @brief 电机输出轴旋转一圈产生的计数个数, 根据电机实际情况填写 */
+ 	float rps_limit;  /**< @brief 电机地转速极限，一般会取比100% PWM占空比时地转速稍小的值以确保PID控制器对速度的控制 */
+@@ -39,6 +65,13 @@
+       * @retval None.
+       */
+     void (*set_pulse)(EncoderMotorObjectTypeDef *self, int pulse);
++
++    /* Position HOLD (MOTOR_EXT 0x05). Kept at the end of the struct so that the
++       offsets of the older fields, which the SWD diagnostic tools read straight
++       from RAM, do not move. */
++    volatile uint8_t position_hold;
++    int16_t hold_max_pulse;     /* PWM cap while holding (300..1000) */
++    uint16_t hold_stall_cycles; /* consecutive cycles at the cap without moving */
+ };
+ 
+ 
+@@ -78,5 +111,60 @@
+ */
+ void encoder_motor_set_speed(EncoderMotorObjectTypeDef *self, float rps);
+ 
+-#endif
++/**
++ * @brief Immediate, safe stop of the motor.
++ *
++ * Forces the accumulated PWM to zero instead of leaving it to the PID. This is
++ * needed because the loop is incremental (pulse += output): if the feedback is
++ * missing or frozen, a zero set point gives zero error, zero output and a PWM
++ * STUCK at its last value, with the motor spinning indefinitely.
++ */
++void encoder_motor_stop(EncoderMotorObjectTypeDef *self);
+ 
++/**
++ * @brief Starts a relative move of delta_ticks from the current position.
++ *
++ * @param delta_ticks     signed distance in encoder ticks (not zero)
++ * @param max_rps         speed limit of the move, in (0, rps_limit] rev/s
++ * @param tolerance_ticks the move is REACHED inside +-tolerance (at least 1)
++ * @param timeout_ms      100..60000 ms; when it expires the status is TIMEOUT
++ * @return 0 if accepted; -1 if any parameter is out of range (nothing changes).
++ */
++int encoder_motor_move_relative(EncoderMotorObjectTypeDef *self,
++                                int32_t delta_ticks,
++                                float max_rps,
++                                int32_t tolerance_ticks,
++                                uint32_t timeout_ms);
++/**
++ * @brief Position HOLD, like motor.HOLD on a LEGO SPIKE hub: keeps the current
++ *        counter with no timeout and, if the shaft is pushed away, drives it
++ *        back with the same control law as MOVE_RELATIVE.
++ *
++ * The PWM is limited to max_pulse. If the motor pushes at that cap without
++ * moving for 3 s (blocked shaft), the HOLD is released with status STALLED and
++ * zero PWM, so that neither the motor nor the driver overheats. A speed
++ * command, MOVE_RELATIVE, CANCEL or a stop all end the HOLD.
++ * @return 0 if accepted; -1 if any parameter is out of range.
++ */
++int encoder_motor_hold(EncoderMotorObjectTypeDef *self,
++                       float max_rps,
++                       int32_t tolerance_ticks,
++                       int max_pulse);
++/** @brief Outer position loop. Call once per 100 Hz control tick (TIM7 ISR),
++ *         after encoder_update() and before encoder_motor_control(). */
++void encoder_motor_position_control(EncoderMotorObjectTypeDef *self);
++/** @brief Leaves the position mode (status CANCELLED) and asks for zero speed. */
++void encoder_motor_position_cancel(EncoderMotorObjectTypeDef *self);
++/** @brief Makes the current position the origin of the reported positions. */
++void encoder_motor_position_zero(EncoderMotorObjectTypeDef *self);
++/** @brief Coherent copy of position, target, error, speed and state. Positions
++ *         are relative to the origin set by encoder_motor_position_zero(). */
++void encoder_motor_position_snapshot(EncoderMotorObjectTypeDef *self,
++                                     int32_t *position_ticks,
++                                     int32_t *target_ticks,
++                                     int32_t *error_ticks,
++                                     float *rps,
++                                     uint8_t *active,
++                                     uint8_t *status);
++
++#endif
+diff -ruN '--exclude=*.o' '--exclude=*.d' '--exclude=*.crf' '--exclude=*.axf' '--exclude=*.htm' '--exclude=*.lnp' '--exclude=*.dep' '--exclude=*.lst' '--exclude=*.map' '--exclude=*.hex' '--exclude=*.bin' '--exclude=*.elf' '--exclude=*.uvguix.*' '--exclude=build-gcc' '--exclude=DebugConfig' official_v1_2/RosRobotControllerM4-armclang/Hiwonder/Portings/imu_porting.c extended_m1/RosRobotControllerM4-armclang/Hiwonder/Portings/imu_porting.c
+--- official_v1_2/RosRobotControllerM4-armclang/Hiwonder/Portings/imu_porting.c	2026-07-27 19:35:37.607742682 -0600
++++ extended_m1/RosRobotControllerM4-armclang/Hiwonder/Portings/imu_porting.c	2026-11-21 18:03:14.033612159 -0600
+@@ -90,6 +90,12 @@
+ #include "QMI8658.h"
+ #include "u8g2_porting.h"
+ 
++/* Extended firmware: minimum interval between IMU reports to the host (ms).
++   50 ms = 20 Hz at most: bounded telemetry that cannot flood the 1 Mbaud UART.
++   The vendor source ships with this report commented out. On the wire it is
++   six little-endian floats: acceleration in m/s^2, then angular rate in rad/s. */
++#define IMU_REPORT_INTERVAL_MS 50u
++
+ #if ENABLE_IMU
+ /**
+  * @brief  imu task 入口函数
+@@ -115,6 +121,8 @@
+ 	}
+     osDelay(100);
+     PacketReportIMU_Raw_TypeDef report;
++    uint32_t last_report_tick = 0u;   /* last report sent to the host, in 1 ms kernel ticks */
++    uint32_t now_tick;
+ 		
+     for(;;) {
+ 		//等待IMU中断发送的信号量，若没有，则一直阻塞等待 osWaitForever
+@@ -128,7 +136,14 @@
+ 			
+ 		//获取Roll、Pitch、重力加速度值请放开下2行注释(第2行注释语句需要配合树莓派等上位机运行搭配ros开发功能包使用) 
+         //printf("%d,%d,%d\r\n",(int)report.array.accel_array[0],(int)report.array.accel_array[1],(int)report.array.accel_array[2]);
+-        //packet_transmit(&packet_controller, PACKET_FUNC_IMU, &report, sizeof(PacketReportIMU_Raw_TypeDef));
++        /* IMU telemetry to the host with an explicit interval. The loop already
++           runs at ~20 Hz because of the osDelay(50) below; the tick guard keeps
++           the limit true even if the pace of the loop changes in the future. */
++        now_tick = osKernelGetTickCount();
++        if((now_tick - last_report_tick) >= IMU_REPORT_INTERVAL_MS) {
++            last_report_tick = now_tick;
++            packet_transmit(&packet_controller, PACKET_FUNC_IMU, &report, sizeof(PacketReportIMU_Raw_TypeDef));
++        }
+         osDelay(50);
+     }
+ }
+diff -ruN '--exclude=*.o' '--exclude=*.d' '--exclude=*.crf' '--exclude=*.axf' '--exclude=*.htm' '--exclude=*.lnp' '--exclude=*.dep' '--exclude=*.lst' '--exclude=*.map' '--exclude=*.hex' '--exclude=*.bin' '--exclude=*.elf' '--exclude=*.uvguix.*' '--exclude=build-gcc' '--exclude=DebugConfig' official_v1_2/RosRobotControllerM4-armclang/Hiwonder/Portings/motor_porting.c extended_m1/RosRobotControllerM4-armclang/Hiwonder/Portings/motor_porting.c
+--- official_v1_2/RosRobotControllerM4-armclang/Hiwonder/Portings/motor_porting.c	2026-07-27 19:35:37.657742836 -0600
++++ extended_m1/RosRobotControllerM4-armclang/Hiwonder/Portings/motor_porting.c	2026-11-21 18:30:05.911035145 -0600
+@@ -40,6 +40,22 @@
+ 	}
+ }
+ 
++void apply_project_motor_config(void)
++{
++    /* JGB37-520R30-12 on M1 and on the position motor (M4 since 2026-10-04):
++       11 encoder lines * x4 quadrature * 1:30 gearbox = 1320 ticks per turn of
++       the output shaft (confirmed on the bench with a mark on the shaft).
++
++       Gains: do NOT use the JGB520 profile that the JETACKER chassis imposes
++       (3960 ticks, KP 63); it is tuned for a 1:90 gearbox. A 1:30 gearbox turns
++       ~3x faster for the same PWM, so the open-loop gain is ~3x higher and the
++       loop oscillates. The vendor itself lowers KP from 63 to 40 in its JGB37
++       profile (1980 ticks). The values below were validated on the bench on
++       M1 (2026-08-22). Arguments: ticks per turn, speed limit, KP, KI, KD. */
++    set_motor_param(motors[0], 1320, PROJECT_MOTOR_RPS_LIMIT, 21.0f, 0.9f, 0.8f);
++    set_motor_param(motors[POSITION_MOTOR_INDEX], 1320, PROJECT_MOTOR_RPS_LIMIT, 21.0f, 0.9f, 0.8f);
++}
++
+ void motors_init(void)
+ {
+     for(int i = 0; i < 4; ++i) {
+@@ -56,6 +72,9 @@
+ 
+     /* 马达 1 */
+     motors[0]->set_pulse = motor1_set_pulse;
++    /* Project motor configuration: applied here and, more importantly, again
++       after set_chassis_type() (see apply_project_motor_config). */
++    apply_project_motor_config();
+     __HAL_TIM_SET_COUNTER(&htim1, 0);
+     __HAL_TIM_ENABLE(&htim1);
+     __HAL_TIM_MOE_ENABLE(&htim1);
+@@ -108,7 +127,10 @@
+     __HAL_TIM_CLEAR_IT(&htim3, TIM_IT_UPDATE);
+     __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
+     __HAL_TIM_ENABLE(&htim3);
+-    HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
++    /* Vendor bug fixed here: the original line started &htim4 (the M3 encoder)
++       a second time instead of &htim3, which left TIM3 without CC1E/CC2E
++       (TIM3_CCER read back as 0 over SWD on the bench). */
++    HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
+ 
+ 
+     // 测速更新定时器
+@@ -188,7 +210,3 @@
+     HAL_TIM_PWM_Start(&htim10, TIM_CHANNEL_1);
+     HAL_TIM_PWM_Start(&htim11, TIM_CHANNEL_1);
+ }
+-
+-
+-
+-
+diff -ruN '--exclude=*.o' '--exclude=*.d' '--exclude=*.crf' '--exclude=*.axf' '--exclude=*.htm' '--exclude=*.lnp' '--exclude=*.dep' '--exclude=*.lst' '--exclude=*.map' '--exclude=*.hex' '--exclude=*.bin' '--exclude=*.elf' '--exclude=*.uvguix.*' '--exclude=build-gcc' '--exclude=DebugConfig' official_v1_2/RosRobotControllerM4-armclang/Hiwonder/Portings/motors_param.h extended_m1/RosRobotControllerM4-armclang/Hiwonder/Portings/motors_param.h
+--- official_v1_2/RosRobotControllerM4-armclang/Hiwonder/Portings/motors_param.h	2026-07-27 19:35:37.640742785 -0600
++++ extended_m1/RosRobotControllerM4-armclang/Hiwonder/Portings/motors_param.h	2026-11-21 18:30:05.911035145 -0600
+@@ -34,7 +34,7 @@
+ #define MOTOR_JGA27_PID_KP  -36.0f
+ #define MOTOR_JGA27_PID_KI  -1.0f
+ #define MOTOR_JGA27_PID_KD  -1.0f
+-#define MOTOR_JGA27_RPS_LIMIT 6.0f 
++#define MOTOR_JGA27_RPS_LIMIT 6.0f
+ 
+ /* 电机轴每转产生11个脉冲,  计数器在AB相上升下降沿均计数即计数值为脉冲数的4倍, 减速比为131.0:1。
+  * 即电机输出轴每转一圈计数器计数值改变 11.0 * 4.0 * 131.0 = 5764
+@@ -43,7 +43,7 @@
+ #define MOTOR_JGB528_PID_KP  300.0f
+ #define MOTOR_JGB528_PID_KI  2.0f
+ #define MOTOR_JGB528_PID_KD  12.0f
+-#define MOTOR_JGB528_RPS_LIMIT 1.1f 
++#define MOTOR_JGB528_RPS_LIMIT 1.1f
+ 
+ /* 电机轴每转产生11个脉冲,  计数器在AB相上升下降沿均计数即计数值为脉冲数的4倍, 减速比为90.0。
+  * 即电机输出轴每转一圈计数器计数值改变 11.0 * 4.0 * 90.0 = 3960
+@@ -56,5 +56,23 @@
+ 
+ void set_motor_type(EncoderMotorObjectTypeDef *motor, MotorTypeEnum type);
+ 
+-#endif
++/* Project motor: JGB37-520R30-12 (1:30), on M1 and on the position motor.
++ * Top speed measured on M4 on 2026-10-04, no load, 11.96 V, 100 % PWM:
++ * +5.76 / -5.74 rev/s (345 rpm). The limit sits just under that value so that
++ * every rpm can be used: close to the top the loop works saturated (100 % PWM)
++ * and the real speed depends on the battery and on the load. Before: 3.0 rev/s
++ * (MOTOR_JGB37_RPS_LIMIT, the vendor's profile for the 1:45 gearbox). */
++#define PROJECT_MOTOR_RPS_LIMIT 5.7f
++
++/**
++ * @brief Applies the project's motor configuration to M1 and to the position
++ *        motor (POSITION_MOTOR_INDEX).
++ *
++ * It MUST be called AFTER set_chassis_type(): that function reconfigures all
++ * four motors for the chassis (JETACKER -> JGB520, 3960 ticks, KP 63) and
++ * would overwrite these values. Setting them only in motors_init() has no
++ * effect.
++ */
++void apply_project_motor_config(void);
+ 
++#endif
+diff -ruN '--exclude=*.o' '--exclude=*.d' '--exclude=*.crf' '--exclude=*.axf' '--exclude=*.htm' '--exclude=*.lnp' '--exclude=*.dep' '--exclude=*.lst' '--exclude=*.map' '--exclude=*.hex' '--exclude=*.bin' '--exclude=*.elf' '--exclude=*.uvguix.*' '--exclude=build-gcc' '--exclude=DebugConfig' official_v1_2/RosRobotControllerM4-armclang/Hiwonder/System/app.c extended_m1/RosRobotControllerM4-armclang/Hiwonder/System/app.c
+--- official_v1_2/RosRobotControllerM4-armclang/Hiwonder/System/app.c	2026-07-27 19:35:37.718743025 -0600
++++ extended_m1/RosRobotControllerM4-armclang/Hiwonder/System/app.c	2026-11-21 18:30:05.911035145 -0600
+@@ -20,6 +20,7 @@
+ #include "u8g2_porting.h"
+ #include "packet_reports.h"
+ #include "packet_handle.h"
++#include "motors_param.h"
+ #include "serial_servo.h"
+ 
+ 
+@@ -32,6 +33,52 @@
+ void sbus_init(void);
+ void chassis_init(void);
+ 
++/* EXTENDED FIRMWARE - independent watchdog (IWDG).
++   The board has no external watchdog, and the IWDG runs from the LSI
++   (~32 kHz), so it keeps counting even if the crystal fails. It is refreshed
++   by the TIM7 ISR (100 Hz, the motor loop), but only while this task has shown
++   signs of life within the last 500 ms. A hang of the interrupts (the CSS NMI,
++   HardFault, Error_Handler, configASSERT) or of the RTOS therefore resets the
++   board, and the reset switches the PWM outputs off.
++   Why it was added: on 2026-10-04 a clock-security (CSS) NMI left the board
++   mute with the PWM frozen; the vendor's NMI handler ends in while(1). */
++#define WATCHDOG_PRESCALER_DIV32     3u   /* IWDG_PR: LSI/32, ~1 kHz */
++#define WATCHDOG_RELOAD              250u /* ~250 ms (LSI 17-47 kHz: 170-470 ms) */
++#define WATCHDOG_HEARTBEAT_MAX_TICKS 50u  /* TIM7 cycles without a heartbeat: 500 ms */
++#define WATCHDOG_HEARTBEAT_PERIOD_MS 100u /* how often the app task reports in */
++
++static volatile uint32_t watchdog_heartbeat_age = 0;
++static volatile uint8_t watchdog_running = 0;
++
++static void watchdog_start(void)
++{
++    __HAL_DBGMCU_FREEZE_IWDG();   /* frozen while a debugger halts the CPU */
++    IWDG->KR = 0xCCCCu;           /* start; it cannot be stopped again until a reset */
++    IWDG->KR = 0x5555u;           /* unlock PR and RLR */
++    IWDG->PR = WATCHDOG_PRESCALER_DIV32;
++    IWDG->RLR = WATCHDOG_RELOAD;
++    /* Wait (bounded) until the new prescaler and reload values are taken. */
++    for(uint32_t i = 0; (IWDG->SR != 0u) && (i < 1000000u); ++i) {
++    }
++    IWDG->KR = 0xAAAAu;           /* first refresh, with the new reload value */
++    watchdog_heartbeat_age = 0;
++    watchdog_running = 1;
++}
++
++/* Called from the TIM7 ISR, 100 times per second. Each call ages the
++   heartbeat by one; the app task puts the age back to zero every 100 ms.
++   If the task stops running, the age reaches 50 (500 ms), the refresh stops
++   and the IWDG resets the MCU about 250 ms later. If the interrupts stop,
++   nobody refreshes at all and the reset comes within those 250 ms. */
++void watchdog_isr_kick(void)
++{
++    if(!watchdog_running) return;
++    if(watchdog_heartbeat_age < WATCHDOG_HEARTBEAT_MAX_TICKS) {
++        ++watchdog_heartbeat_age;
++        IWDG->KR = 0xAAAAu;
++    }
++}
++
+ 
+ void button_event_callback(ButtonObjectTypeDef *button,  ButtonEventIDEnum event)
+ {
+@@ -60,7 +107,7 @@
+     leds_init();
+     buzzers_init();
+     buttons_init();
+-	
++
+     button_register_callback(buttons[0], button_event_callback);
+     button_register_callback(buttons[1], button_event_callback);
+ 
+@@ -76,11 +123,15 @@
+ 
+     chassis_init();
+     set_chassis_type(CHASSIS_TYPE_JETACKER);
++    /* set_chassis_type() reconfigures all four motors with the chassis
++       profile; re-apply the real configuration of M1 and of the position
++       motor after it. */
++    apply_project_motor_config();
+ 
++    /* Everything is initialised: from here on, a hang resets the board. */
++    watchdog_start();
+     for(;;) {
+-		osDelay(10000);
++        watchdog_heartbeat_age = 0;   /* heartbeat: the RTOS is alive */
++        osDelay(WATCHDOG_HEARTBEAT_PERIOD_MS);
+     }
+ }
+-
+-
+-
+diff -ruN '--exclude=*.o' '--exclude=*.d' '--exclude=*.crf' '--exclude=*.axf' '--exclude=*.htm' '--exclude=*.lnp' '--exclude=*.dep' '--exclude=*.lst' '--exclude=*.map' '--exclude=*.hex' '--exclude=*.bin' '--exclude=*.elf' '--exclude=*.uvguix.*' '--exclude=build-gcc' '--exclude=DebugConfig' official_v1_2/RosRobotControllerM4-armclang/Hiwonder/System/global_conf.h extended_m1/RosRobotControllerM4-armclang/Hiwonder/System/global_conf.h
+--- official_v1_2/RosRobotControllerM4-armclang/Hiwonder/System/global_conf.h	2026-07-27 19:35:37.733743072 -0600
++++ extended_m1/RosRobotControllerM4-armclang/Hiwonder/System/global_conf.h	2026-11-21 18:03:14.034612176 -0600
+@@ -12,6 +12,15 @@
+ //#define BATTERY_LOW_ALARM_THRESHOLD 6300  /* 低电压报警阈值, 单位毫伏 */
+ #define BATTERY_LOW_ALARM_THRESHOLD 9600
+ 
++/* Extended firmware: the motor with position control (MOTOR_EXT 0x0B).
++   Index 0..3 = M1..M4. Only this one motor gets the outer position loop; to
++   move it to another port, change the index here (it went from M1 to M4 on
++   2026-10-04, with the same JGB37-520R30-12 motor). */
++#define POSITION_MOTOR_INDEX 3u
++#if POSITION_MOTOR_INDEX > 3u
++#error "POSITION_MOTOR_INDEX must be between 0 and 3"
++#endif
++
+ 
+ #define KEY1_PUSHED_LEVEL 0
+ #define KEY2_PUSHED_LEVEL 0
+diff -ruN '--exclude=*.o' '--exclude=*.d' '--exclude=*.crf' '--exclude=*.axf' '--exclude=*.htm' '--exclude=*.lnp' '--exclude=*.dep' '--exclude=*.lst' '--exclude=*.map' '--exclude=*.hex' '--exclude=*.bin' '--exclude=*.elf' '--exclude=*.uvguix.*' '--exclude=build-gcc' '--exclude=DebugConfig' official_v1_2/RosRobotControllerM4-armclang/Hiwonder/System/global.h extended_m1/RosRobotControllerM4-armclang/Hiwonder/System/global.h
+--- official_v1_2/RosRobotControllerM4-armclang/Hiwonder/System/global.h	2026-07-27 19:35:37.730743062 -0600
++++ extended_m1/RosRobotControllerM4-armclang/Hiwonder/System/global.h	2026-11-21 18:03:14.034612176 -0600
+@@ -53,6 +53,9 @@
+ 
+ void set_chassis_type(uint8_t chassis_type);
+ 
++/* Refreshes the watchdog (IWDG) from the TIM7 ISR while the RTOS is still alive (app.c). */
++void watchdog_isr_kick(void);
++
+ 
+ #endif
+ 
+diff -ruN '--exclude=*.o' '--exclude=*.d' '--exclude=*.crf' '--exclude=*.axf' '--exclude=*.htm' '--exclude=*.lnp' '--exclude=*.dep' '--exclude=*.lst' '--exclude=*.map' '--exclude=*.hex' '--exclude=*.bin' '--exclude=*.elf' '--exclude=*.uvguix.*' '--exclude=build-gcc' '--exclude=DebugConfig' official_v1_2/RosRobotControllerM4-armclang/Hiwonder/System/packet_handle.c extended_m1/RosRobotControllerM4-armclang/Hiwonder/System/packet_handle.c
+--- official_v1_2/RosRobotControllerM4-armclang/Hiwonder/System/packet_handle.c	2026-07-27 19:35:37.750743126 -0600
++++ extended_m1/RosRobotControllerM4-armclang/Hiwonder/System/packet_handle.c	2026-11-21 18:03:14.035612192 -0600
+@@ -32,6 +32,78 @@
+     uint8_t motor_mask;
+ } MotorMultiStopCommandTypeDef;
+ 
++/* ---------------------------------------------------------------------------
++ * EXTENDED FIRMWARE - MOTOR_EXT (function 0x0B): position control of one motor
++ *
++ * The frames keep the vendor's format on USART3 (1 Mbaud, the USB-C port
++ * labelled UART2):
++ *   0xAA 0x55 | function | length | payload[length] | CRC-8/MAXIM
++ * with the CRC computed over function, length and payload. The first payload
++ * byte is one of the sub-commands below. Multi-byte fields are little-endian
++ * and the structs are packed (#pragma pack(1) above), so these struct layouts
++ * ARE the wire format.
++ *
++ * Every well-formed command is answered with one MotorExtReport (20 bytes)
++ * that repeats the sub-command; CAPABILITIES is answered with
++ * MotorExtCapabilities (8 bytes) instead. Nothing is sent spontaneously: the
++ * host polls STATUS to follow a move.
++ * ------------------------------------------------------------------------- */
++enum MotorExtSubCommand {
++    MOTOR_EXT_CAPABILITIES = 0x00,  /* protocol version, motor mask, ticks per turn */
++    MOTOR_EXT_MOVE_RELATIVE = 0x01, /* move by a signed number of ticks */
++    MOTOR_EXT_CANCEL = 0x02,        /* leave the position mode, zero speed */
++    MOTOR_EXT_ZERO = 0x03,          /* the current position becomes the origin */
++    MOTOR_EXT_STATUS = 0x04,        /* report only */
++    MOTOR_EXT_HOLD = 0x05,          /* hold the current position (protocol v3) */
++};
++
++typedef struct {                /* MOVE_RELATIVE request, 14 bytes */
++    uint8_t cmd;
++    uint8_t motor_id;           /* must be POSITION_MOTOR_INDEX */
++    int32_t delta_ticks;        /* signed distance, 1320 ticks per turn here */
++    float max_rps;              /* speed limit, rev/s */
++    uint16_t tolerance_ticks;
++    uint16_t timeout_ms;        /* 100..60000 */
++} MotorExtMoveRelativeTypeDef;
++
++typedef struct {                /* CANCEL, ZERO and STATUS requests, 2 bytes */
++    uint8_t cmd;
++    uint8_t motor_id;
++} MotorExtSimpleCommandTypeDef;
++
++typedef struct {                /* HOLD request, 10 bytes */
++    uint8_t cmd;
++    uint8_t motor_id;
++    float max_rps;              /* speed limit while coming back, rev/s */
++    uint16_t tolerance_ticks;
++    uint16_t max_pulse;         /* PWM cap while holding, 300..1000 */
++} MotorExtHoldTypeDef;
++
++typedef struct {                /* reply to every command, 20 bytes */
++    uint8_t cmd;                /* the sub-command being answered */
++    uint8_t motor_id;
++    uint8_t status;             /* EncoderPositionStatusEnum, or 5 = invalid command */
++    uint8_t active;             /* 1 while a move or a HOLD is running */
++    int32_t position_ticks;     /* relative to the origin set by ZERO */
++    int32_t target_ticks;
++    int32_t error_ticks;        /* target - position */
++    float rps;                  /* measured speed, rev/s */
++} MotorExtReportTypeDef;
++
++/* v1: position control fixed on M1. v2: the position motor is the bit set in
++   motor_mask (POSITION_MOTOR_INDEX) and the ticks per turn are read from the
++   motor object; same frame layout. v3: HOLD (0x05) and the statuses
++   6 (holding) and 7 (stalled). */
++#define MOTOR_EXT_PROTOCOL_VERSION 3u
++
++typedef struct {
++    uint8_t cmd;
++    uint8_t version;
++    uint8_t motor_mask;
++    uint8_t reserved;
++    uint32_t ticks_per_revolution;
++} MotorExtCapabilitiesTypeDef;
++
+ /* 串口舵机 */
+ typedef struct {
+     uint8_t cmd;
+@@ -190,7 +262,7 @@
+             report.args[0] = load_unload;
+             packet_transmit(&packet_controller, PACKET_FUNC_BUS_SERVO, &report, 4);
+             break;
+-		}			
++		}
+         case 0x10: { /* ID 写入 */
+             SerialServoCommandTypeDef *cmd = (SerialServoCommandTypeDef *)frame->data_and_checksum;
+             serial_servo_set_id(&serial_servo_controller, cmd->servo_id, cmd->args[0]);
+@@ -266,8 +338,6 @@
+             break;
+     }
+ }
+-
+-
+ /**
+ * @brief PWM舵机串口命令回调处理
+ * @param frame 数据帧
+@@ -341,27 +411,38 @@
+     switch(frame->data_and_checksum[0]) {
+         case 0: {
+             MotorSingalCtrlCommandTypeDef *mscc = (MotorSingalCtrlCommandTypeDef *)frame->data_and_checksum;
++            if(frame->data_length < sizeof(MotorSingalCtrlCommandTypeDef)) break;
++            if(mscc->motor_id > 3u) break; /* the original indexed motors[] without a bounds check */
++            if(mscc->motor_id == POSITION_MOTOR_INDEX) encoder_motor_position_cancel(motors[POSITION_MOTOR_INDEX]);
+             motors[mscc->motor_id]->pid_controller.set_point = mscc->speed;
+             break;
+         }
+         case 1: {
+             MotorMutilCtrlCommandTypeDef *mmcc = NULL;
+             mmcc = (MotorMutilCtrlCommandTypeDef *)frame->data_and_checksum;
++            if(frame->data_length < 2u) break;
++            /* a motor_num larger than what the frame carries would read past the buffer */
++            if(frame->data_length < 2u + mmcc->motor_num * sizeof(mmcc->element[0])) break;
+             for(int i = 0; i < mmcc->motor_num; ++i) {
++                if(mmcc->element[i].motor_id > 3u) continue;
++                if(mmcc->element[i].motor_id == POSITION_MOTOR_INDEX) encoder_motor_position_cancel(motors[POSITION_MOTOR_INDEX]);
+                 motors[mmcc->element[i].motor_id]->pid_controller.set_point = mmcc->element[i].speed;
+             }
+             break;
+         }
+         case 2:  {
+             MotorSingalStopCommandTypeDef *mssc = (MotorSingalStopCommandTypeDef *)frame->data_and_checksum;
+-            motors[mssc->motor_id]->pid_controller.set_point = 0;
++            if(mssc->motor_id > 3u) break;
++            /* Hard stop: empties the accumulator of the incremental loop. A zero
++               set point alone does not stop the motor if the feedback is missing. */
++            encoder_motor_stop(motors[mssc->motor_id]);
+             break;
+         }
+         case 3: {
+             MotorMultiStopCommandTypeDef *mmsc = (MotorMultiStopCommandTypeDef *)frame->data_and_checksum;
+             for(int i = 0; i < 4; ++i) {
+                 if(mmsc->motor_mask & (0x01 << i)) {
+-                    motors[i]->pid_controller.set_point = 0;
++                    encoder_motor_stop(motors[i]);
+                 }
+             }
+             break;
+@@ -371,6 +452,84 @@
+     }
+ }
+ 
++/* Sends one MotorExtReport. status_override = 0xFF reports the real status
++   of the motor; any other value replaces it (5 = command rejected). */
++static void packet_motor_ext_report(uint8_t cmd, uint8_t status_override)
++{
++    MotorExtReportTypeDef report;
++    encoder_motor_position_snapshot(motors[POSITION_MOTOR_INDEX], &report.position_ticks,
++                                    &report.target_ticks, &report.error_ticks,
++                                    &report.rps, &report.active, &report.status);
++    report.cmd = cmd;
++    report.motor_id = POSITION_MOTOR_INDEX;
++    if(status_override != 0xFFu) report.status = status_override;
++    packet_transmit(&packet_controller, PACKET_FUNC_MOTOR_EXT, &report, sizeof(report));
++}
++
++/* MOTOR_EXT dispatcher. Frames with the wrong length are dropped without an
++   answer. A motor_id other than POSITION_MOTOR_INDEX, an out-of-range
++   parameter or an unknown sub-command is answered with status 5 (invalid) and
++   leaves the motor untouched. */
++static void packet_motor_ext_handle(struct PacketRawFrame *frame)
++{
++    uint8_t cmd;
++    if(frame->data_length < 1u) return;
++    cmd = frame->data_and_checksum[0];
++
++    if(cmd == MOTOR_EXT_CAPABILITIES) {
++        MotorExtCapabilitiesTypeDef report = {
++            MOTOR_EXT_CAPABILITIES, MOTOR_EXT_PROTOCOL_VERSION,
++            (uint8_t)(1u << POSITION_MOTOR_INDEX), 0u,
++            (uint32_t)motors[POSITION_MOTOR_INDEX]->ticks_per_circle};
++        packet_transmit(&packet_controller, PACKET_FUNC_MOTOR_EXT, &report, sizeof(report));
++        return;
++    }
++
++    if(frame->data_length < sizeof(MotorExtSimpleCommandTypeDef)) return;
++    if(frame->data_and_checksum[1] != POSITION_MOTOR_INDEX) {
++        packet_motor_ext_report(cmd, 5u);
++        return;
++    }
++
++    switch(cmd) {
++        case MOTOR_EXT_MOVE_RELATIVE: {
++            MotorExtMoveRelativeTypeDef *move;
++            int result;
++            if(frame->data_length != sizeof(MotorExtMoveRelativeTypeDef)) return;
++            move = (MotorExtMoveRelativeTypeDef *)frame->data_and_checksum;
++            result = encoder_motor_move_relative(motors[POSITION_MOTOR_INDEX], move->delta_ticks,
++                                                 move->max_rps, move->tolerance_ticks,
++                                                 move->timeout_ms);
++            packet_motor_ext_report(cmd, result == 0 ? 0xFFu : 5u);
++            break;
++        }
++        case MOTOR_EXT_CANCEL:
++            encoder_motor_position_cancel(motors[POSITION_MOTOR_INDEX]);
++            packet_motor_ext_report(cmd, 0xFFu);
++            break;
++        case MOTOR_EXT_ZERO:
++            encoder_motor_position_zero(motors[POSITION_MOTOR_INDEX]);
++            packet_motor_ext_report(cmd, 0xFFu);
++            break;
++        case MOTOR_EXT_STATUS:
++            packet_motor_ext_report(cmd, 0xFFu);
++            break;
++        case MOTOR_EXT_HOLD: {
++            MotorExtHoldTypeDef *hold;
++            int result;
++            if(frame->data_length != sizeof(MotorExtHoldTypeDef)) return;
++            hold = (MotorExtHoldTypeDef *)frame->data_and_checksum;
++            result = encoder_motor_hold(motors[POSITION_MOTOR_INDEX], hold->max_rps,
++                                        hold->tolerance_ticks, hold->max_pulse);
++            packet_motor_ext_report(cmd, result == 0 ? 0xFFu : 5u);
++            break;
++        }
++        default:
++            packet_motor_ext_report(cmd, 5u);
++            break;
++    }
++}
++
+ 
+ void packet_handle_init(void)
+ {
+@@ -379,5 +538,5 @@
+     packet_register_callback(&packet_controller, PACKET_FUNC_MOTOR, packet_motor_handle);
+     packet_register_callback(&packet_controller, PACKET_FUNC_BUS_SERVO, packet_serial_servo_handle);
+     packet_register_callback(&packet_controller, PACKET_FUNC_PWM_SERVO, packet_pwm_servo_handle);
++    packet_register_callback(&packet_controller, PACKET_FUNC_MOTOR_EXT, packet_motor_ext_handle);
+ }
+-
+diff -ruN '--exclude=*.o' '--exclude=*.d' '--exclude=*.crf' '--exclude=*.axf' '--exclude=*.htm' '--exclude=*.lnp' '--exclude=*.dep' '--exclude=*.lst' '--exclude=*.map' '--exclude=*.hex' '--exclude=*.bin' '--exclude=*.elf' '--exclude=*.uvguix.*' '--exclude=build-gcc' '--exclude=DebugConfig' official_v1_2/RosRobotControllerM4-armclang/Hiwonder/USB_HOST/usbh_hiwonder_hid.c extended_m1/RosRobotControllerM4-armclang/Hiwonder/USB_HOST/usbh_hiwonder_hid.c
+--- official_v1_2/RosRobotControllerM4-armclang/Hiwonder/USB_HOST/usbh_hiwonder_hid.c	2026-07-27 19:35:37.786743238 -0600
++++ extended_m1/RosRobotControllerM4-armclang/Hiwonder/USB_HOST/usbh_hiwonder_hid.c	2026-11-21 18:03:14.035612192 -0600
+@@ -259,7 +259,10 @@
+ #if (osCMSIS < 0x20000U)
+             (void)osMessagePut(phost->os_event, phost->os_msg, 0U);
+ #else
+-            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, NULL);
++            /* Extended firmware (GCC build): the last argument is a uint32_t timeout,
++               so it is 0U; the vendor source passes NULL, which GCC 14 and later
++               reject. The same change is made in the four calls further down. */
++            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, 0U);
+ #endif
+ #endif
+             break;
+@@ -284,7 +287,7 @@
+ #if (osCMSIS < 0x20000U)
+             (void)osMessagePut(phost->os_event, phost->os_msg, 0U);
+ #else
+-            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, NULL);
++            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, 0U);
+ #endif
+ #endif
+             break;
+@@ -300,7 +303,7 @@
+ #if (osCMSIS < 0x20000U)
+             (void)osMessagePut(phost->os_event, phost->os_msg, 0U);
+ #else
+-            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, NULL);
++            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, 0U);
+ #endif
+ #endif
+             break;
+@@ -330,7 +333,7 @@
+ #if (osCMSIS < 0x20000U)
+                     (void)osMessagePut(phost->os_event, phost->os_msg, 0U);
+ #else
+-                    (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, NULL);
++                    (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, 0U);
+ #endif
+ #endif
+                 }
+@@ -372,7 +375,7 @@
+ #if (osCMSIS < 0x20000U)
+             (void)osMessagePut(phost->os_event, phost->os_msg, 0U);
+ #else
+-            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, NULL);
++            (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, 0U);
+ #endif
+ #endif
+         }
