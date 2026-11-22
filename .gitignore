@@ -1,0 +1,23 @@
+# STM32CubeIDE / Eclipse build output and per-user state
+firmware/Debug/
+firmware/Release/
+firmware/.settings/
+firmware/*.launch
+.metadata/
+
+# reproducible build output
+build-reproducible/
+
+# compiled artefacts (the validated image is published as a release asset)
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+*.hex
+*.bin
+
+__pycache__/
+*.py[cod]

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Include paths and symbols of the firmware, in the format STM32CubeIDE exports them.
+     Project > Properties > C/C++ General > Paths and Symbols > Import Settings... -->
+<cdtprojectproperties>
+  <section name="org.eclipse.cdt.internal.ui.wizards.settingswizards.IncludePaths">
+    <language id="org.eclipse.cdt.core.gcc" name="C Source File">
+      <includepath>Core/Inc</includepath>
+      <includepath>Drivers/CMSIS/Core/Include</includepath>
+      <includepath>Drivers/CMSIS/Device/ST/STM32F4xx/Include</includepath>
+      <includepath>Drivers/CMSIS/Include</includepath>
+      <includepath>Drivers/STM32F4xx_HAL_Driver/Inc</includepath>
+      <includepath>Drivers/STM32F4xx_HAL_Driver/Inc/Legacy</includepath>
+      <includepath>Hiwonder/Chassis</includepath>
+      <includepath>Hiwonder/LVGL_UI</includepath>
+      <includepath>Hiwonder/LVGL_UI/guider_customer_fonts</includepath>
+      <includepath>Hiwonder/LVGL_UI/guider_fonts</includepath>
+      <includepath>Hiwonder/LVGL_UI/images</includepath>
+      <includepath>Hiwonder/Misc</includepath>
+      <includepath>Hiwonder/Peripherals</includepath>
+      <includepath>Hiwonder/Portings</includepath>
+      <includepath>Hiwonder/System</includepath>
+      <includepath>Hiwonder/USB_HOST</includepath>
+      <includepath>Middlewares/ST/STM32_USB_Host_Library/Class/HID/Inc</includepath>
+      <includepath>Middlewares/ST/STM32_USB_Host_Library/Core/Inc</includepath>
+      <includepath>Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2</includepath>
+      <includepath>Middlewares/Third_Party/FreeRTOS/Source/include</includepath>
+      <includepath>Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F</includepath>
+      <includepath>Third_Party</includepath>
+      <includepath>Third_Party/Fusion/Fusion</includepath>
+      <includepath>Third_Party/LVGL</includepath>
+      <includepath>Third_Party/LVGL/porting</includepath>
+      <includepath>Third_Party/LVGL/src</includepath>
+      <includepath>Third_Party/Lw</includepath>
+      <includepath>Third_Party/RTT</includepath>
+      <includepath>Third_Party/U8g2</includepath>
+      <includepath>USB_HOST/App</includepath>
+      <includepath>USB_HOST/Target</includepath>
+      <includepath>compat</includepath>
+    </language>
+  </section>
+  <section name="org.eclipse.cdt.internal.ui.wizards.settingswizards.Macros">
+    <language id="org.eclipse.cdt.core.gcc" name="C Source File">
+      <macro>
+        <name>USE_HAL_DRIVER</name>
+        <value/>
+      </macro>
+      <macro>
+        <name>STM32F407xx</name>
+        <value/>
+      </macro>
+      <macro>
+        <name>LV_CONF_INCLUDE_SIMPLE</name>
+        <value/>
+      </macro>
+      <macro>
+        <name>LV_LVGL_H_INCLUDE_SIMPLE</name>
+        <value/>
+      </macro>
+    </language>
+  </section>
+</cdtprojectproperties>
